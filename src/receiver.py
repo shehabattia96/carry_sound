@@ -21,6 +21,7 @@ class AudioReceiver:
         sample_rate: int = 44100,
         channels: int = 2,
         buffer_size: int = 10,
+        chunk_size: int = 1024,
     ):
         """Initialize the audio receiver.
 
@@ -30,12 +31,14 @@ class AudioReceiver:
             sample_rate: Sample rate in Hz
             channels: Number of audio channels (1=mono, 2=stereo)
             buffer_size: Number of chunks to buffer before playing
+            chunk_size: Number of samples per chunk (must match sender)
         """
         self.listen_port = listen_port
         self.device_id = device_id
         self.sample_rate = sample_rate
         self.channels = channels
         self.buffer_size = buffer_size
+        self.chunk_size = chunk_size
         self.is_running = False
         self.socket: Optional[socket.socket] = None
         self.stream: Optional[sd.OutputStream] = None
@@ -44,6 +47,7 @@ class AudioReceiver:
         self.bytes_received = 0
         self.chunks_received = 0
         self.underruns = 0
+        self.partial_chunk: Optional[np.ndarray] = None
 
     def list_devices(self) -> None:
         """List all available audio devices."""
@@ -99,20 +103,36 @@ class AudioReceiver:
             print(f"⚠ Audio callback status: {status}")
 
         try:
-            if self.audio_buffer:
-                audio_chunk = self.audio_buffer.popleft()
+            frames_written = 0
 
-                # Handle size mismatch
-                if len(audio_chunk) >= frames:
-                    outdata[:] = audio_chunk[:frames]
+            # First, use any partial chunk from previous callback
+            if self.partial_chunk is not None and len(self.partial_chunk) > 0:
+                frames_to_copy = min(len(self.partial_chunk), frames - frames_written)
+                outdata[frames_written:frames_written + frames_to_copy] = self.partial_chunk[:frames_to_copy]
+                frames_written += frames_to_copy
+
+                # Keep remaining data for next callback
+                if frames_to_copy < len(self.partial_chunk):
+                    self.partial_chunk = self.partial_chunk[frames_to_copy:]
                 else:
-                    # Pad with zeros if chunk is smaller than requested
-                    outdata[:len(audio_chunk)] = audio_chunk
-                    outdata[len(audio_chunk):] = 0
-            else:
-                # Buffer underrun - output silence
-                outdata.fill(0)
-                self.underruns += 1
+                    self.partial_chunk = None
+
+            # Fill remaining frames from buffer
+            while frames_written < frames and self.audio_buffer:
+                audio_chunk = self.audio_buffer.popleft()
+                frames_to_copy = min(len(audio_chunk), frames - frames_written)
+                outdata[frames_written:frames_written + frames_to_copy] = audio_chunk[:frames_to_copy]
+                frames_written += frames_to_copy
+
+                # Save any leftover data for next callback
+                if frames_to_copy < len(audio_chunk):
+                    self.partial_chunk = audio_chunk[frames_to_copy:]
+
+            # Fill any remaining frames with silence
+            if frames_written < frames:
+                outdata[frames_written:].fill(0)
+                if frames_written == 0:  # Only count as underrun if we had no data at all
+                    self.underruns += 1
 
         except Exception as e:
             print(f"✗ Error in audio callback: {e}")
@@ -129,6 +149,7 @@ class AudioReceiver:
             print(f"  Device: {self.device_id if self.device_id is not None else 'default'}")
             print(f"  Sample rate: {self.sample_rate} Hz")
             print(f"  Channels: {self.channels}")
+            print(f"  Chunk size: {self.chunk_size}")
             print(f"  Buffer size: {self.buffer_size} chunks")
             print()
 
@@ -136,11 +157,12 @@ class AudioReceiver:
             self.receive_thread = threading.Thread(target=self.receive_audio, daemon=True)
             self.receive_thread.start()
 
-            # Create output stream
+            # Create output stream with matching blocksize
             self.stream = sd.OutputStream(
                 device=self.device_id,
                 samplerate=self.sample_rate,
                 channels=self.channels,
+                blocksize=self.chunk_size,
                 callback=self.audio_callback,
                 latency="low",
             )
@@ -210,6 +232,12 @@ class AudioReceiver:
     help="Number of channels: 1=mono, 2=stereo (default: 2)",
 )
 @click.option(
+    "--chunk-size",
+    default=1024,
+    type=int,
+    help="Chunk size in samples (must match sender, default: 1024)",
+)
+@click.option(
     "--buffer-size",
     default=10,
     type=int,
@@ -220,13 +248,14 @@ class AudioReceiver:
     is_flag=True,
     help="List available audio devices and exit",
 )
-def main(port: int, device: Optional[int], sample_rate: int, channels: int, buffer_size: int, list_devices: bool) -> None:
+def main(port: int, device: Optional[int], sample_rate: int, channels: int, chunk_size: int, buffer_size: int, list_devices: bool) -> None:
     """Receive audio stream over UDP and play it."""
     receiver = AudioReceiver(
         listen_port=port,
         device_id=device,
         sample_rate=sample_rate,
         channels=channels,
+        chunk_size=chunk_size,
         buffer_size=buffer_size,
     )
 
